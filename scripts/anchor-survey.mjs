@@ -29,10 +29,59 @@
 //   - "Transfer-capable" != "fiat off-ramp we care about": some hits are crypto
 //     anchors or DEX gateways with no fiat corridor.
 
+import { pathToFileURL } from 'node:url';
 import { fetchDirectoryCandidates } from './lib/directory.mjs';
 
 const DIRECTORY_URL = 'https://api.stellar.expert/explorer/public/directory?tag[]=anchor&limit=200';
 const PER_ANCHOR_TIMEOUT_MS = 12_000;
+
+// Fixed, well-formed Stellar public key used only as the `account` query
+// parameter for SEP-10 liveness probes. It is unfunded, holds nothing, and its
+// secret was never stored — nothing is ever signed with it.
+export const PROBE_ACCOUNT = 'GBGE3HRVH4LGSNZXVLEBITOCQZFWHCGRUM2DY6GHZCHQQEXLCOFP2BWD';
+
+// stellar.toml keys mapped to the endpoint names the survey reports.
+const ENDPOINT_KEYS = {
+  sep6: 'TRANSFER_SERVER',
+  sep24: 'TRANSFER_SERVER_SEP0024',
+  sep38: 'ANCHOR_QUOTE_SERVER',
+  sep31: 'DIRECT_PAYMENT_SERVER',
+  sep10: 'WEB_AUTH_ENDPOINT',
+};
+
+/** Extract the SEP endpoint URLs declared in a stellar.toml body. */
+export function parseTomlEndpoints(toml) {
+  const endpoints = {};
+  for (const [name, key] of Object.entries(ENDPOINT_KEYS)) {
+    const match = new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']`, 'im').exec(toml);
+    if (match) endpoints[name] = match[1].trim();
+  }
+  return endpoints;
+}
+
+// SEP-10 liveness must mirror how wallets call the endpoint: always with
+// `?account=`. MoneyGram's https://stellar.moneygram.com/stellaradapterservice/auth
+// answers a bare GET with HTTP 500 but a GET with `?account=` with HTTP 400
+// (census 2026-09-23), so a bare probe would mark the busiest anchor on the
+// network as down. Any status < 500 means the service is up.
+export async function checkSep10Liveness(url, { fetchImpl = fetch } = {}) {
+  const probeUrl = `${url}${url.includes('?') ? '&' : '?'}account=${PROBE_ACCOUNT}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PER_ANCHOR_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(probeUrl, {
+      redirect: 'follow',
+      signal: ctrl.signal,
+      headers: { 'User-Agent': 'stellar-intel-anchor-survey/1.0' },
+    });
+    return { url, status: res.status, alive: res.status < 500 };
+  } catch (err) {
+    const error = `${err?.name ?? 'Error'}${err?.cause?.code ? `:${err.cause.code}` : ''}`;
+    return { url, status: null, alive: false, error };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const CONCURRENCY = 24;
 
 const asJson = process.argv.includes('--json');
@@ -143,7 +192,8 @@ async function classify(domain) {
       const { status, toml } = await attempt(url);
       if (toml == null) return { domain, reachable: false, reason: `HTTP ${status}` };
       const has = (key) => new RegExp(`^\\s*${key}\\s*=`, 'im').test(toml);
-      return {
+      const endpoints = parseTomlEndpoints(toml);
+      const result = {
         domain,
         reachable: true,
         sep6: has('TRANSFER_SERVER'),
@@ -151,6 +201,8 @@ async function classify(domain) {
         sep38: has('ANCHOR_QUOTE_SERVER'),
         sep31: has('DIRECT_PAYMENT_SERVER'),
       };
+      if (endpoints.sep10) result.sep10 = await checkSep10Liveness(endpoints.sep10);
+      return result;
     } catch (err) {
       last = `${err?.name ?? 'Error'}${err?.cause?.code ? `:${err.cause.code}` : ''}`;
     }
@@ -242,7 +294,10 @@ async function main() {
   console.log(`\nTransfer-capable: ${transferCapable.map((r) => r.domain).join(', ')}`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
